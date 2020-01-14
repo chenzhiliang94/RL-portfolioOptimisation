@@ -6,7 +6,7 @@ Math Honours
   - `tensorflow 1.15` (don't use tensor flow version > 2!)
   - `gym 0.15.4`
   - `stable-baselines 2.9.0`
-2. Run `RL.py` on terminal or in an IDE
+3. Run `RL.py` on terminal or in an IDE
 
 Example of output picture:
 ![strategy](https://github.com/chenzhiliang94/RL-portfolioOptimisation/blob/master/RL%20strategy%20visualisation.png)
