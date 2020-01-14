@@ -1,16 +1,20 @@
 import gym
 from gym import spaces
+import math
 import random
 import numpy as np
 import json
 import datetime as dt
 from rl.agents.ddpg import DDPGAgent
 from rl.agents.dqn import DQNAgent
+
+# Since the updated tf is version 2, we have to disable some v2 features to make this work
 import tensorflow.compat.v1 as tf
 tf.disable_v2_behavior()
+
 # some existing rl models
-from stable_baselines.common.policies import MlpPolicy
-from stable_baselines.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines.common.policies import MlpPolicy, FeedForwardPolicy
+from stable_baselines.common.vec_env import DummyVecEnv, VecNormalize, VecCheckNan
 from stable_baselines import PPO2, DQN, SAC, A2C
 
 # actor critic model; needs to take in custom model for actor and critic
@@ -25,30 +29,43 @@ from tensorflow.keras.layers import Dense, Activation, Flatten
 from tensorflow.keras.layers import Input, Concatenate
 from tensorflow.keras.optimizers import Adam
 '''
-tf.disable_v2_behavior()
 
+
+# some parameters; self explanatory
 TRAINING_DURATION = 900
-NUM_DAYS_BACK = 5 # how many past days observations to take note of before making a decision
-FEATURES = 6 # how many features to take note per day
+NUM_DAYS_BACK = 21 # how many past days observations to take note of before making a decision
+FEATURES = 5 # how many features to take note per day
 NUM_DAYS_TEST = 300 # how many testing days to plot
-RISK_FREE_RATE = 1.0008 # daily risk free rate for keeping money as cash instead of investing
-MAX_ACCOUNT_BALANCE = 100000
-MAX_NUM_SHARES = 1000000
+RISK_FREE_RATE = 1.00008 # daily risk free rate for keeping money as cash instead of investing
+MAX_ACCOUNT_BALANCE = 30000
+MAX_NUM_SHARES = 10000
 MAX_SHARE_PRICE = 10000
 MAX_OPEN_POSITIONS = 5
 MAX_STEPS = 20000
 
-INITIAL_ACCOUNT_BALANCE = 10000
+INITIAL_ACCOUNT_BALANCE = 10000 # initial money to have
+PLOT_INTO_FUTURE = 30 # plot the prices into the future after last trade
+test_in_sample = False # whether to run test on in sample data or out of sample
+TRAIN_STEPS = 2500 # how many iterations to train
+INVALID_PENALTY = -10 # unused currently
+gamma = 0.99 # delay factor of reward
+LEARNING_RATE = 0.001
+ENTROPY_COEFFICIENT = 0.75 # how much randomness to add in during training to encourage exploration
+STEPS = 128 # how many samples to use per iteration
+UPPER_BOUND_INVESTMENT = 1 # unused
+deterministic_prediction = True
+to_plot_stock = "GOOG" # when we plot our networth throughout time, we also plot this stock's price movement
+STOCKS = [ "DB","GOOG", "NFLX", "GS", "MCD", "WFC", "BAC", "T"] # the stocks; the csv file must be present in direction /stocks
 
-test_in_sample = False
-TRAIN_STEPS = 20000
-deterministic_prediction = False
-STOCKS = ["DB", "T"]
+# reward function; simply the immediate reward we get from one trade (change in yesterday's networth with today's)
+# notice the reward is divided by a constant to keep reward value small
+def reward(yesterday_net_worth, today_net_worth):
+    return ((today_net_worth)-(yesterday_net_worth))/INITIAL_ACCOUNT_BALANCE
+
 # divide to training and testing
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
-s = MinMaxScaler(feature_range=(0.25,0.75))
-
+s = MinMaxScaler(feature_range=(0.1,0.9))
 
 def combine_stock_price(stock_names):
     # join stock data into one df (increase number of cols)
@@ -73,35 +90,42 @@ df = combine_stock_price(STOCKS)
 df_train = df.iloc[:TRAINING_DURATION]
 df_test = df.iloc[TRAINING_DURATION:]
 df_test.reset_index(inplace=True)
-print(df_train.head())
 
 class StockTradingEnvironment(gym.Env):
     """A stock trading environment for OpenAI gym"""
     metadata = {'render.modes': ['human']}
 
-    def __init__(self, df):
+    def __init__(self, df, stock):
         super(StockTradingEnvironment, self).__init__()
+        self.stock = stock
         self.df = df
+        self.shares_held = {key: 0 for key in stock}
+        self.cost_basis = {key: 0 for key in stock}
+        self.total_shares_sold = {key: 0 for key in stock}
+        self.total_sales_value = {key: 0 for key in stock}
+        self.action = {key: "DONT DO ANYTHING" for key in stock}
+
         self.reward_range = (0, MAX_ACCOUNT_BALANCE)
         # ratio of money put into stock
         self.action_space = spaces.Box(
-            low=np.array([0, 0]), high=np.array([1, 1]), dtype=np.float16)
+            low=np.array([0.] * len(STOCKS)), high=np.array([UPPER_BOUND_INVESTMENT] * len(STOCKS)), dtype=np.float16)
         # Prices contains the OHCL values for the last five prices
         self.observation_space = spaces.Box(
-            low=0, high=1, shape=(FEATURES, NUM_DAYS_BACK+1), dtype=np.float16) # +1 because we include own observation
+            low=0, high=1, shape=(1, (NUM_DAYS_BACK+1) * FEATURES * len(self.stock) + 4 * len(self.stock) + 2 ), dtype=np.float16) # +1 because we include own observation
 
     def reset(self):
         # Reset the state of the environment to an initial state
         self.balance = INITIAL_ACCOUNT_BALANCE
         self.net_worth = INITIAL_ACCOUNT_BALANCE
         self.max_net_worth = INITIAL_ACCOUNT_BALANCE
-        self.shares_held = 0
-        self.cost_basis = 0
-        self.total_shares_sold = 0
-        self.total_sales_value = 0
+        self.prev_day_net_worth = INITIAL_ACCOUNT_BALANCE
         self.reward = 0
-        self.action = "BUY"
-        self.stocks = []
+        self.stock = STOCKS
+        self.shares_held = {key: 0 for key in self.stock}
+        self.cost_basis = {key: 0 for key in self.stock}
+        self.total_shares_sold = {key: 0 for key in self.stock}
+        self.total_sales_value = {key: 0 for key in self.stock}
+        self.action = {key: "DONT DO ANYTHING" for key in self.stock}
 
 
         # Set the current step to a random point within the data frame
@@ -111,15 +135,28 @@ class StockTradingEnvironment(gym.Env):
 
     def _next_observation(self):
         # Get the data points for the last 5 days and scale to between 0-1
-        frame = np.array([
-            self.df.loc[self.current_step-NUM_DAYS_BACK: self.current_step , 'OpenT'].values ,
-            self.df.loc[self.current_step-NUM_DAYS_BACK: self.current_step , 'HighT'].values ,
-            self.df.loc[self.current_step-NUM_DAYS_BACK: self.current_step , 'LowT'].values ,
-            self.df.loc[self.current_step-NUM_DAYS_BACK: self.current_step , 'Adj CloseT'].values ,
-            self.df.loc[self.current_step-NUM_DAYS_BACK: self.current_step , 'VolumeT'].values ,])
+        frame = np.array([])
+        for stock_name in self.stock:
+
+            temp = [
+                self.df.loc[self.current_step-NUM_DAYS_BACK: self.current_step , 'Open'+stock_name].values ,
+                self.df.loc[self.current_step-NUM_DAYS_BACK: self.current_step , 'High'+stock_name].values ,
+                self.df.loc[self.current_step-NUM_DAYS_BACK: self.current_step , 'Low'+stock_name].values ,
+                self.df.loc[self.current_step-NUM_DAYS_BACK: self.current_step , 'Adj Close'+stock_name].values ,
+                self.df.loc[self.current_step-NUM_DAYS_BACK: self.current_step , 'Volume'+stock_name].values ,]
+            for v in temp:
+                frame = np.append(frame, v)
+        print("cost basis")
+        print(np.array(list(self.cost_basis.values())))
+        frame = np.append(frame, 0.001+ np.array(list(self.shares_held.values()))/MAX_NUM_SHARES) # append shares held as obs
+        frame = np.append(frame, 0.001+np.array(list(self.cost_basis.values()))) # append cost basis held as obs
+        frame = np.append(frame, 0.001+np.array(list(self.total_shares_sold.values()))/ 100000)  # append shares sold as obs
+        frame = np.append(frame, 0.001+np.array(list(self.total_sales_value.values()))/ (MAX_NUM_SHARES * MAX_SHARE_PRICE))  # append shares sales value as obs
+        frame = np.append(frame, 0.001+np.array([self.balance/ MAX_ACCOUNT_BALANCE])) # one element
+        frame = np.append(frame, 0.001+np.array([self.max_net_worth/ MAX_ACCOUNT_BALANCE])) # one element
+        return frame
+        '''
         # Append additional data and scale each value to between 0-1
-        print(self.df.loc[self.current_step-NUM_DAYS_BACK: self.current_step , 'OpenT'].values)
-        print(frame)
         obs = np.append(frame, [[
             self.balance / MAX_ACCOUNT_BALANCE,
             self.max_net_worth / MAX_ACCOUNT_BALANCE,
@@ -128,11 +165,11 @@ class StockTradingEnvironment(gym.Env):
             self.total_shares_sold / MAX_NUM_SHARES,
             self.total_sales_value / (MAX_NUM_SHARES * MAX_SHARE_PRICE),
         ]], axis=0)
-
-        exit()
         return obs
+        '''
 
     def step(self, action):
+        self.prev_day_net_worth = self.net_worth
         # Execute one time step within the environment
         self.current_step += 1
         # take_action calculates the new balance due to the action taken (with the new stock price)
@@ -140,15 +177,16 @@ class StockTradingEnvironment(gym.Env):
 
         # if we have reached last row of training data
         # reset to the start of training data
-        if self.current_step == len(self.df.loc[:, 'Open'].values)-1:
+        if self.current_step == len(self.df.loc[:, 'OpenT'].values)-1:
             self.current_step = NUM_DAYS_BACK
+            self.reset()
 
         # reward function design - play with this!
         # net worth here denotes the net worth in the NEW DAY (the first line
         # has already increased the step by 1)
         delay_modifier_a = ((MAX_STEPS-self.current_step) / MAX_STEPS)
         delay_modifier_b = (self.current_step) / MAX_STEPS
-        reward = ((self.reward * MAX_ACCOUNT_BALANCE) - INITIAL_ACCOUNT_BALANCE) / INITIAL_ACCOUNT_BALANCE
+        reward = self.reward
 
         # done variable is a boolean indicator which terminates the RL.
         # We do not want this to happen; done is True when we become bankrupt
@@ -156,46 +194,56 @@ class StockTradingEnvironment(gym.Env):
         obs = self._next_observation()
 
         # must returns these 4 items
-        return obs, reward, done, {"action":self.action}
+        return obs, reward, done, {"action":self.action["T"]}
 
     def _take_action(self, action):
         # take_action is a function which changes the observable environment when
         # an action is taken; in our case, an action changes our portfolio.
         # Just some if-else arithmetic to change our balance, shares etc for certain actions
 
-        #current_price = random.uniform(
-        #    self.df.loc[self.current_step, "Open"],
-        #   self.df.loc[self.current_step, "Adj Close"])
-
         # if sum of money allocation > 1:
         # it is an invalid action. we penalise. Hopefully, the agent learns not to allocate
         # the portfolio as [0.75, 0.75] for example
+        norm = np.sum(action)
+        if not norm == 0: # normalise action (if not all zeroes)
+            action = [a / norm for a in action]
+
         if np.sum(action) > 1:
-            self.reward = 0
+            print("invalid action during training")
+            self.reward = INVALID_PENALTY
             self.action = dict.fromkeys(self.action, "DONT DO ANYTHING")
             return
 
         new_investment_worth = 0 # this will be the worth on next day's closing
         for index, stock_name in enumerate(self.stock):
+            print("stock name: " + stock_name)
             yesterday_closing = self.df.loc[self.current_step-1, "Adj Close Actual" + stock_name] # yesterday's closing price
             today_closing = self.df.loc[self.current_step, "Adj Close Actual" + stock_name] # today's closing price. This is how much our
                                                                           # held stock will change in price
             yesterday_shares_held = self.shares_held[stock_name] # shares held at yesterday's closing
             action_type = action[index] # a real value from 0-1
             to_invest = self.net_worth * action_type
-
+            print("yesterday's closing: " + str(yesterday_closing))
+            print("today's closing: " + str(today_closing))
+            print("yesterday share amount held: " + str(yesterday_shares_held))
+            print("yesterday's networth: " + str(self.net_worth))
+            print("percentage networth put into this stock: " + str(action[index]))
+            if (math.isnan(action[index])):
+                print(action)
+                exit()
             self.shares_held[stock_name] = to_invest / yesterday_closing # we buy the stocks at yesterday's closing price
             self.cost_basis[stock_name] = np.abs(today_closing - yesterday_closing)/yesterday_closing # absolute difference change in stock price
-            if yesterday_shares_held > self.shares_held: # we sold
-                self.total_shares_sold[stock_name] += (yesterday_shares_held-self.shares_held)
-                self.total_sales_value[stock_name] += (yesterday_closing * (yesterday_shares_held-self.shares_held))
+            if yesterday_shares_held > self.shares_held[stock_name]: # we sold
+                self.total_shares_sold[stock_name] += (yesterday_shares_held-self.shares_held[stock_name])
+                self.total_sales_value[stock_name] += (yesterday_closing * (yesterday_shares_held-self.shares_held[stock_name]))
                 self.action[stock_name] = "SELL"
-            elif yesterday_shares_held == self.shares_held:
+            elif yesterday_shares_held == self.shares_held[stock_name]:
                 self.action[stock_name] = "DONT DO ANYTHING"
             else:
                 self.action[stock_name] = "BUY"
 
             new_investment_worth += self.shares_held[stock_name] * today_closing # new investment worth of this stock
+
             '''
             if action_type < 1:
                 # Buy amount % of balance in shares
@@ -226,12 +274,21 @@ class StockTradingEnvironment(gym.Env):
             # balance (whatever cash we have at hand) is multiplied by a risk free rate
             # this is daily
         '''
-        to_hold = self.net_worth * (1 - np.sum(self.action)) # whatever's not used to ivnest goes into risk-free balance
+        print("actions")
+        print(action)
+        to_hold = self.net_worth * (1 - np.sum(action)) # whatever's not used to invest goes into risk-free balance
+        print("today's  available cash:")
+        print(to_hold)
+        print("today's investment worth:")
+        print(new_investment_worth)
         self.balance = to_hold
         self.balance *= RISK_FREE_RATE  # risk free rate for cash at hand
         self.net_worth = self.balance + new_investment_worth # shares held is multipled by today's closing
-        self.reward = self.net_worth
-
+        self.reward = reward(self.prev_day_net_worth, self.net_worth) # reward is percentage change of networth
+        print("today's net worth:")
+        print(self.net_worth)
+        print("immediate reward:")
+        print(self.reward)
         if self.net_worth > self.max_net_worth:
             self.max_net_worth = self.net_worth
 
@@ -250,17 +307,19 @@ class StockTradingEnvironment(gym.Env):
         return self.net_worth, self.shares_held
 
 
-env = DummyVecEnv([lambda: StockTradingEnvironment(df_train)])
+env = DummyVecEnv([lambda: StockTradingEnvironment(df_train, STOCKS)])
+env = VecCheckNan(env, raise_exception=True)
 nb_actions = env.action_space.shape[0]
 
 print("learning...")
 # proximal policy optimisation, these two lines of code trains the MlpPolicy using PPO2 algorithm
-model = PPO2(MlpPolicy, env, verbose=1,gamma=0.95,learning_rate=0.001)
+model = PPO2(MlpPolicy, env, verbose=1,gamma=gamma,learning_rate=LEARNING_RATE, seed=10, n_steps=STEPS, cliprange=0.2,
+             ent_coef=ENTROPY_COEFFICIENT)
 model.learn(total_timesteps=TRAIN_STEPS)
 
 if (test_in_sample):
     df_test=df_train
-env_test = DummyVecEnv([lambda: StockTradingEnvironment(df_test)])
+env_test = DummyVecEnv([lambda: StockTradingEnvironment(df_test, STOCKS)])
 obs = env_test.reset()
 
 
@@ -274,9 +333,10 @@ shares_held = []
 # day 5 - 305
 for i in range(NUM_DAYS_TEST):
     action, _states = model.predict(obs,deterministic=deterministic_prediction)
+
     obs, rewards, done, what_did_we_do = env_test.step(action)
-    price.append(obs[0][3][-1])
-    print(what_did_we_do)
+    index = (STOCKS.index(to_plot_stock) * (NUM_DAYS_BACK + 1) * FEATURES + ((NUM_DAYS_BACK+1)*4-1)) # 4th column is adj close
+    price.append(obs[0][0][index])
     strategy.append(what_did_we_do[0]["action"])
 
     nw,sh = env_test.render()
@@ -307,14 +367,14 @@ for i in range(len(strategy)):
 
 # actions are taken in day 5.5 to 306.5 (at night when stock closes)
 plt.subplot(211)
-plt.title("Strategy by RL on T stocks")
-plt.plot(df_test['Adj Close'].iloc[:NUM_DAYS_TEST+NUM_DAYS_BACK+2], label='stock closing price',c='black') # plot actual movement of stock
+plt.title("Strategy by RL on " + to_plot_stock +" stocks")
+plt.plot(df_test['Adj Close'+to_plot_stock].iloc[:NUM_DAYS_TEST+NUM_DAYS_BACK+2+PLOT_INTO_FUTURE], label='stock closing price',c='black') # plot actual movement of stock
 plt.scatter(buy_action_x, buy_action_y,c='green', label="buy",s=10) # plot all buy actions
 plt.scatter(sell_action_x, sell_action_y,c='red', label="sell",s=10) # plot all sell actions
-plt.scatter(NUM_DAYS_BACK+1, df_test['Adj Close'].iloc[NUM_DAYS_BACK+1],marker='x',c='black') # plot day 1 price
-plt.scatter(NUM_DAYS_TEST+NUM_DAYS_BACK+1, df_test['Adj Close'].iloc[NUM_DAYS_TEST+NUM_DAYS_BACK+1],marker='x',c='black') # plot last day end price
-plt.annotate('start: '+str(round(df_test['Adj Close'].iloc[NUM_DAYS_BACK+1],2)),(NUM_DAYS_BACK+1, 0.9*df_test['Adj Close'].iloc[NUM_DAYS_BACK+1]))
-plt.annotate('end: '+str(round(df_test['Adj Close'].iloc[NUM_DAYS_TEST+NUM_DAYS_BACK+1],2)),(NUM_DAYS_TEST+NUM_DAYS_BACK+1, 0.9*df_test['Adj Close'].iloc[NUM_DAYS_TEST+NUM_DAYS_BACK+1]))
+plt.scatter(NUM_DAYS_BACK+1, df_test['Adj Close'+to_plot_stock].iloc[NUM_DAYS_BACK+1],marker='x',c='black') # plot day 1 price
+plt.scatter(NUM_DAYS_TEST+NUM_DAYS_BACK+1, df_test['Adj Close'+to_plot_stock].iloc[NUM_DAYS_TEST+NUM_DAYS_BACK+1],marker='x',c='black') # plot last day end price
+plt.annotate('start: '+str(round(df_test['Adj Close'+to_plot_stock].iloc[NUM_DAYS_BACK+1],2)),(NUM_DAYS_BACK+1, 0.9*df_test['Adj Close'+to_plot_stock].iloc[NUM_DAYS_BACK+1]))
+plt.annotate('end: '+str(round(df_test['Adj Close'+to_plot_stock].iloc[NUM_DAYS_TEST+NUM_DAYS_BACK+1],2)),(NUM_DAYS_TEST+NUM_DAYS_BACK+1, 0.9*df_test['Adj Close'+to_plot_stock].iloc[NUM_DAYS_TEST+NUM_DAYS_BACK+1]))
 plt.legend()
 
 plt.subplot(212)
